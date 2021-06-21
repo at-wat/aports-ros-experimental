@@ -1,0 +1,253 @@
+pkgname=ros-noetic-roscpp-core
+_pkgname=roscpp_core
+pkgver=0.7.2
+pkgrel=0
+pkgdesc="$_pkgname package for ROS noetic"
+url="http://www.ros.org/wiki/roscpp_core"
+arch="all"
+license="BSD"
+
+depends="ros-noetic-cpp-common ros-noetic-roscpp-serialization ros-noetic-roscpp-traits ros-noetic-rostime ros-noetic-cpp-common ros-noetic-roscpp-serialization ros-noetic-roscpp-traits ros-noetic-rostime"
+makedepends="py-setuptools py-rosdep py-rosinstall py-rosinstall-generator py-wstool chrpath ros-noetic-catkin"
+
+subpackages="$pkgname-dbg $pkgname-doc"
+
+source=""
+builddir="$startdir/abuild"
+srcdir="/tmp/dummy-src-dir"
+buildlog="$builddir/ros-abuild-build.log"
+checklog="$builddir/ros-abuild-check.log"
+statuslog="$builddir/ros-abuild-status.log"
+if [ x${GENERATE_BUILD_LOGS} != "xyes" ]; then
+  buildlog="/dev/null"
+  checklog="/dev/null"
+  statuslog="/dev/null"
+fi
+
+export ROS_PYTHON_VERSION=3
+rosinstall="- git:
+    local-name: roscpp_core
+    uri: https://github.com/ros-gbp/roscpp_core-release.git
+    version: release/noetic/roscpp_core/0.7.2-1
+"
+
+prepare() {
+  set -o pipefail
+  mkdir -p $builddir
+  echo "preparing" > $statuslog
+  cd "$builddir"
+  rm -rf src || true
+  mkdir -p src
+  echo "$rosinstall" > pkg.rosinstall
+  wstool init --shallow src pkg.rosinstall
+  find $startdir -maxdepth 1 -name "*.patch" | while read patchfile; do
+    echo "Applying $patchfile"
+    (cd src/* && patch -p1 -i $patchfile)
+  done
+}
+
+build() {
+  set -o pipefail
+  echo "building" > $statuslog
+  cd "$builddir"
+  # Overwrite shebang
+  find src -type f | while read file; do
+    h=$(head -n1 "$file")
+    rewrite_shebang=false
+    if echo $h | grep -q -s "^#\!\s*/usr/bin/env\s*python$"; then
+      rewrite_shebang=true
+    fi
+    if echo $h | grep -q -s "^#\!\s*/usr/bin/python$"; then
+      rewrite_shebang=true
+    fi
+    if [ $rewrite_shebang == "true" ]; then
+      echo "WARN: rewriting python shebang of $file"
+      sed -i "1c#\!/usr/bin/env python3" "$file"
+    fi
+  done
+  source /usr/ros/noetic/setup.sh
+  catkin_make_isolated \
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo 2>&1 | tee $buildlog
+}
+
+check() {
+  if [ -f $startdir/NOCHECK ]; then
+    echo "Check skipped" | tee $checklog
+    return 0
+  fi
+  set -o pipefail
+  echo "checking" >> $statuslog
+  cd "$builddir"
+  source /usr/ros/noetic/setup.sh
+  source devel_isolated/setup.sh
+  catkin_make_isolated \
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    --catkin-make-args run_tests 2>&1 | tee $checklog
+  catkin_test_results 2>&1 | tee $checklog
+}
+
+dbg() {
+  mkdir -p "$subpkgdir"
+  default_dbg
+}
+
+package() {
+  echo "packaging" >> $statuslog
+  mkdir -p "$pkgdir"
+  cd "$builddir"
+  export DESTDIR="$pkgdir"
+
+  source /usr/ros/noetic/setup.sh
+  catkin_make_isolated \
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    --install-space /usr/ros/noetic
+  catkin_make_isolated \
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    --install --install-space /usr/ros/noetic
+  rm -f \
+    "$pkgdir"/usr/ros/noetic/setup.* \
+    "$pkgdir"/usr/ros/noetic/local_setup.* \
+    "$pkgdir"/usr/ros/noetic/.rosinstall \
+    "$pkgdir"/usr/ros/noetic/_setup_util.py \
+    "$pkgdir"/usr/ros/noetic/env.sh \
+    "$pkgdir"/usr/ros/noetic/.catkin
+
+  # Tweak invalid RPATH
+  find $pkgdir -name "*.so" | while read so; do
+    chrpath_out=$(chrpath ${so} || true)
+    if echo ${chrpath_out} | grep -q "RPATH="; then
+      rpath=$(echo -n "${chrpath_out}" | sed -e "s/^.*RPATH=//")
+      if echo "${rpath}" | grep -q -e "\(home\|aports\)"; then
+        echo "RPATH contains home/aports!: ${rpath}"
+        rpathfix=$(echo -n "${rpath}" | tr ":" "\n" \
+          | grep -v -e home | grep -v -e aports \
+          | tr "\n" ":" | sed -e "s/:$//; s/::/:/;")
+        echo "Fixing to ${rpathfix}"
+        chrpath -r ${rpathfix} ${so} || (echo chrpath failed; false)
+      fi
+    fi
+  done
+
+  # Tweak hardcoded library versions
+  find $pkgdir -name "*.cmake" | while read cm; do
+    libs=$(sed -n '/^set(libraries/{s/^.*"\(.*\)")$/\1/;s/;/ /g;p}' $cm)
+    for lib in $libs; do
+      rep=
+      # lib.so.0.1.2 -> lib.so.0.1
+      if echo $lib | grep -q -e '\.so\.[0-9]\{1,\}\.[0-9]\{1,\}\.[0-9]\{1,\}$'; then
+        rep=$(echo $lib | sed -e 's/\(\.so\.[0-9]\{1,\}\.[0-9]\{1,\}\)\.[0-9]\{1,\}$/\1/')
+      fi
+      # lib-0.1.so.2 -> lib-0.1.so
+      if echo $lib | grep -q -e '-[0-9]\{1,\}\.[0-9]\{1,\}\.so\.[0-9]\{1,\}$'; then
+        rep=$(echo $lib | sed -e 's/\(-[0-9]\{1,\}\.[0-9]\{1,\}\.so\)\.[0-9]\{1,\}$/\1/')
+      fi
+
+      if [ ! -z "$rep" ]; then
+        if [ -f $rep ]; then
+          echo "$cm: $lib -> $rep"
+          sed -e "s|\([\";]\)$lib\([\";]\)|\1$rep\2|g" -i $cm
+        else
+          echo "$cm: $lib is specified, but $rep doesn't exist"
+        fi
+      fi
+    done
+  done
+
+  # Install license files
+  licensedir="$pkgdir"/usr/share/licenses/$pkgname/
+  cd $builddir/src/$_pkgname
+  find . \
+      -iname "license*" -or \
+      -iname "copyright*" -or \
+      -iname "copying*" -or \
+      -iname "gnu-*gpl*" \
+    | while read file; do
+    # Copy license files under the source
+    if echo $file | grep -e '^\./\.'; then
+      # Omit files under hidden directory
+      continue
+    fi
+    echo "Copying license files from source tree: $file"
+    install -Dm644 $file "$licensedir"/$file
+  done
+  if [ -f $startdir/LICENSE ]; then
+    # If LICENSE file is in aports directory, copy it
+    echo "Copying license file from aports"
+    install -Dm644 $startdir/LICENSE "$licensedir"/LICENSE
+  fi
+  if [ -f $startdir/LICENSE_URLS ]; then
+    # If LICENSE_URLS file is in aports directory, download it
+    echo "Downloading license file from URLs"
+    cat $startdir/LICENSE_URLS | while read url; do
+      echo "- $url"
+      mkdir -p "$licensedir"
+      wget -O "$licensedir"/$(basename $url) $url
+    done
+  fi
+  if [ -z "$(find "$licensedir" -type f)" ]; then
+    # If no explicit license file found, extract from source files
+    mkdir -p "$licensedir"
+    echo "Copying license from source file headers"
+    find . -name "*.h" -or -name "*.c" -or -name "*.cpp" -or -name "*.py" | while read file; do
+      echo "Checking license header in $file"
+      tmplicense=$(mktemp)
+      # Extract heading comment
+      sed -n '1{/^#!/d};
+        /\/\*/{/\*\//d; :l0; p; n; /\*\//!b l0; p; q};
+        /^\s*#/{:l1; /^#!/!p; n; /^\s*#/b l1; q};
+        /^\s*\/\//{:l2; p; n; /^\s*\/\//b l2; q};' $file > $tmplicense
+      # Remove comment syntax
+      sed 's/\/\*//; s/\*\///; s/^s*\/\/\s\{0,1\}//;
+        s/^ \* \{0,1\}//; s/^\s*# \{0,1\}//; s/\s\+$//;' -i $tmplicense
+      # Trim empty lines
+      sed ':l0; /^$/d; n; /^$/!b l0; :l1; n; b l1;' -i $tmplicense
+      sed '${/^$/d}' -i $tmplicense
+
+      if ! grep -i -e "\(license\|copyright\|copyleft\)" $tmplicense > /dev/null; then
+        # Looks not like a license statement
+        echo "No license statement"
+        rm -f $tmplicense
+        continue
+      fi
+
+      echo "Checking duplication"
+      licenses=$(mktemp)
+      find "$licensedir" -type f > $licenses
+      savethis=true
+      while read existing; do
+        if diff -bBiw $tmplicense $existing > /dev/null; then
+          # Same license statement found
+          savethis=false
+          break
+        fi
+      done < $licenses
+
+      if $savethis; then
+        # Save license statement
+        local num=0
+        while true; do
+          newfile="$licensedir"/LICENSE.$num
+          if [ ! -f "$newfile" ]; then
+            echo "Saving license statement as $newfile"
+            mv $tmplicense $newfile
+            break
+          fi
+          num=$(expr $num + 1)
+        done
+      fi
+
+      rm -f $licenses $tmplicense
+    done
+  fi
+  # List license files
+  echo "License files:"
+  find "$licensedir" -type f | xargs -n1 echo "-"
+
+  echo "finished" >> $statuslog
+}
+
+doc() {
+  mkdir -p $subpkgdir
+
+  default_doc
+}
